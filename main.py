@@ -120,6 +120,9 @@ class BillingMetrics(BaseModel):
     anomalies_open: int
     anomalies_critical: int
     leakage_amount_flagged: float
+      
+      sam
+=======
 
 
 # ── 3. Internal Database Helper Utility ─────────────────────────
@@ -345,4 +348,64 @@ async def list_anomalies(status: Optional[str] = None, severity: Optional[str] =
     query += " ORDER BY a.detected_at DESC"
     
     rows = await db.fetch(query, *params)
+    return [{**dict(r), "detected_at": str(r["detected_at"]), "resolved_at": str(r["resolved_at"]) if r["resolved_at"] else None} for r in rows sam
+
+# [11/14] Get Open Anomalies
+@router.get("/anomalies/open", response_model=List[AnomalyOut], tags=["Anomalies"])
+async def get_open_anomalies(db=Depends(get_db)):
+    rows = await db.fetch("""
+        SELECT a.*, i.invoice_number, c.name AS customer_name FROM billing_anomalies a
+        JOIN billing_invoices i ON a.invoice_id = i.id JOIN customers c ON a.customer_id = c.id
+        WHERE a.status = 'open'
+        ORDER BY CASE a.severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 WHEN 'low' THEN 4 END, a.detected_at DESC
+    """)
     return [{**dict(r), "detected_at": str(r["detected_at"]), "resolved_at": str(r["resolved_at"]) if r["resolved_at"] else None} for r in rows]
+
+# [12/14] Get Anomaly by ID
+@router.get("/anomalies/{anomaly_id}", response_model=AnomalyOut, tags=["Anomalies"])
+async def get_anomaly(anomaly_id: int, db=Depends(get_db)):
+    row = await db.fetchrow("""
+        SELECT a.*, i.invoice_number, c.name AS customer_name FROM billing_anomalies a
+        JOIN billing_invoices i ON a.invoice_id = i.id JOIN customers c ON a.customer_id = c.id WHERE a.id = $1
+    """, anomaly_id)
+    if not row:
+        raise HTTPException(404, f"Anomaly trace ID {anomaly_id} missing")
+    return {**dict(row), "detected_at": str(row["detected_at"]), "resolved_at": str(row["resolved_at"]) if row["resolved_at"] else None}
+
+# [13/14] Update Anomaly Status
+@router.put("/anomalies/{anomaly_id}/status", response_model=AnomalyOut, tags=["Anomalies"])
+async def update_anomaly_status(anomaly_id: int, req: UpdateAnomalyStatusRequest, db=Depends(get_db)):
+    exists = await db.fetchval("SELECT id FROM billing_anomalies WHERE id = $1", anomaly_id)
+    if not exists:
+        raise HTTPException(404, f"Anomaly trace ID {anomaly_id} missing")
+
+    resolved_time = datetime.now() if req.status == "resolved" else None
+    await db.execute("UPDATE billing_anomalies SET status = $1, resolution = $2, resolved_at = $3 WHERE id = $4", req.status, req.resolution, resolved_time, anomaly_id)
+    return await get_anomaly(anomaly_id, db)
+
+# [14/14] Access Aggregated Metrics
+@router.get("/metrics", response_model=BillingMetrics, tags=["Metrics"])
+async def get_metrics(db=Depends(get_db)):
+    inv = await db.fetchrow("""
+        SELECT COUNT(*) FILTER (WHERE DATE(issued_at) = CURRENT_DATE) AS issued,
+               COUNT(*) FILTER (WHERE status='paid' AND DATE(updated_at) = CURRENT_DATE) AS paid,
+               COUNT(*) FILTER (WHERE status='overdue') AS overdue,
+               COALESCE(SUM(paid_amount) FILTER (WHERE DATE_TRUNC('month', updated_at) = DATE_TRUNC('month', NOW())), 0.0) AS mtd
+        FROM billing_invoices
+    """)
+    anom = await db.fetchrow("""
+        SELECT COUNT(*) FILTER (WHERE status='open') AS open,
+               COUNT(*) FILTER (WHERE status='open' AND severity='critical') AS crit,
+               COALESCE(SUM(amount_affected) FILTER (WHERE status='open'), 0.0) AS leaked
+        FROM billing_anomalies
+    """)
+    return {
+        "invoices_issued_today": inv["issued"],
+        "invoices_paid_today": inv["paid"],
+        "invoices_overdue": inv["overdue"],
+        "revenue_collected_mtd": float(inv["mtd"]),
+        "anomalies_open": anom["open"],
+        "anomalies_critical": anom["crit"],
+        "leakage_amount_flagged": float(anom["leaked"])
+    }
+
