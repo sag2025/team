@@ -280,3 +280,69 @@ async def get_customer_invoices(customer_id: int, db=Depends(get_db)):
         ORDER BY i.issued_at DESC
     """, customer_id)
     return [{**dict(r), "billing_period_start": str(r["billing_period_start"]), "billing_period_end": str(r["billing_period_end"]), "due_date": str(r["due_date"])} for r in rows]
+
+# [7/14] Record Payment
+@router.post("/payments", response_model=PaymentOut, status_code=201, tags=["Payments"])
+async def record_payment(req: CreatePaymentRequest, db=Depends(get_db)):
+    invoice = await db.fetchrow("SELECT customer_id, paid_amount, total_amount FROM billing_invoices WHERE id = $1", req.invoice_id)
+    if not invoice:
+        raise HTTPException(404, f"Invoice ID {req.invoice_id} not found")
+
+    payment = await db.fetchrow("""
+        INSERT INTO billing_payments (invoice_id, customer_id, amount, payment_method, status, transaction_ref, paid_at)
+        VALUES ($1, $2, $3, $4, 'completed', $5, NOW()) RETURNING *
+    """, req.invoice_id, invoice["customer_id"], req.amount, req.payment_method, req.transaction_ref)
+
+    new_paid = float(invoice["paid_amount"] or 0.0) + req.amount
+    await db.execute("""
+        UPDATE billing_invoices 
+        SET paid_amount = $1, status = CASE WHEN $1 >= total_amount THEN 'paid' ELSE status END, updated_at = NOW()
+        WHERE id = $2
+    """, new_paid, req.invoice_id)
+
+    res = dict(payment)
+    res["paid_at"] = str(res["paid_at"])
+    return res
+
+# [8/14] Get Invoice Payments
+@router.get("/payments/invoice/{invoice_number}", response_model=List[PaymentOut], tags=["Payments"])
+async def get_invoice_payments(invoice_number: str, db=Depends(get_db)):
+    resolved_id = await db.fetchval("SELECT id FROM billing_invoices WHERE invoice_number = $1", invoice_number)
+    if not resolved_id:
+        return []
+
+    rows = await db.fetch("SELECT * FROM billing_payments WHERE invoice_id = $1 ORDER BY paid_at DESC", resolved_id)
+    return [{**dict(r), "paid_at": str(r["paid_at"])} for r in rows]
+
+# [9/14] Create Anomaly
+@router.post("/anomalies", response_model=AnomalyOut, status_code=201, tags=["Anomalies"])
+async def create_anomaly(req: CreateAnomalyRequest, db=Depends(get_db)):
+    inv = await db.fetchrow("SELECT i.invoice_number, i.customer_id, c.name FROM billing_invoices i JOIN customers c ON i.customer_id = c.id WHERE i.id = $1", req.invoice_id)
+    if not inv:
+        raise HTTPException(404, f"Invoice ID {req.invoice_id} not found")
+
+    row = await db.fetchrow("""
+        INSERT INTO billing_anomalies (invoice_id, customer_id, anomaly_type, severity, amount_affected, description, status, detected_at)
+        VALUES ($1, $2, $3, $4, $5, $6, 'open', NOW()) RETURNING *
+    """, req.invoice_id, inv["customer_id"], req.anomaly_type, req.severity, req.amount_affected, req.description)
+    
+    return {**dict(row), "invoice_number": inv["invoice_number"], "customer_name": inv["name"], "detected_at": str(row["detected_at"]), "resolved_at": str(row["resolved_at"]) if row["resolved_at"] else None}
+
+# [10/14] List Anomalies
+@router.get("/anomalies", response_model=List[AnomalyOut], tags=["Anomalies"])
+async def list_anomalies(status: Optional[str] = None, severity: Optional[str] = None, db=Depends(get_db)):
+    query = """
+        SELECT a.*, i.invoice_number, c.name AS customer_name FROM billing_anomalies a
+        JOIN billing_invoices i ON a.invoice_id = i.id JOIN customers c ON a.customer_id = c.id WHERE 1=1
+    """
+    params = []
+    if status:
+        params.append(status)
+        query += f" AND a.status = ${len(params)}"
+    if severity:
+        params.append(severity)
+        query += f" AND a.severity = ${len(params)}"
+    query += " ORDER BY a.detected_at DESC"
+    
+    rows = await db.fetch(query, *params)
+    return [{**dict(r), "detected_at": str(r["detected_at"]), "resolved_at": str(r["resolved_at"]) if r["resolved_at"] else None} for r in rows]
